@@ -58,8 +58,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.mount("/static/materials", StaticFiles(directory=str(MATERIALS_DIR)), name="materials")
-app.mount("/static", StaticFiles(directory="static"), name="static")
 
 def ensure_materials_table():
     with closing(sqlite3.connect(DATABASE_PATH)) as conn, conn:
@@ -82,6 +80,7 @@ def ensure_materials_table():
             ("subject", "TEXT"), ("department", "TEXT"), ("department_id", "TEXT"), ("group_name", "TEXT"),
             ("created_at", "DATETIME"),
             ("file_url", "TEXT"), ("upload_date", "DATETIME"), ("telegram_file_id", "TEXT"),
+            ("telegram_file_unique_id", "TEXT"),
             ("drive_url", "TEXT"), ("drive_download_url", "TEXT"), ("telegram_backup_url", "TEXT"),
             ("topic_id", "INTEGER"), ("file_size", "INTEGER"), ("drive_file_id", "TEXT"),
             ("subject_id", "INTEGER"), ("department_id", "TEXT"),
@@ -89,6 +88,7 @@ def ensure_materials_table():
             if column not in columns:
                 conn.execute(f"ALTER TABLE materials ADD COLUMN {column} {declaration}")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_materials_telegram_file_id ON materials(telegram_file_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_materials_telegram_file_unique_id ON materials(telegram_file_unique_id)")
         conn.execute("UPDATE materials SET upload_date=COALESCE(upload_date,created_at)")
         conn.execute("UPDATE materials SET created_at=COALESCE(created_at,upload_date,CURRENT_TIMESTAMP)")
         conn.execute("UPDATE materials SET file_url='/static/materials/' || file_name WHERE file_url IS NULL")
@@ -543,6 +543,8 @@ def add_lecture_from_bot(payload: dict = Body(...), api_key: str | None = Header
     drive_file_id = str(payload.get("drive_file_id") or "").strip()
     telegram_backup_url = str(payload.get("telegram_backup_url") or "").strip() or None
     telegram_file_id = str(payload.get("telegram_file_id") or "").strip()
+    telegram_file_unique_id = str(payload.get("telegram_file_unique_id") or "").strip()
+    dedupe_telegram_id = telegram_file_unique_id or telegram_file_id
     department = str(payload.get("department") or payload.get("department_name") or os.getenv(
         "DEFAULT_LECTURE_DEPARTMENT", "\u0627\u0644\u0623\u0645\u0646 \u0627\u0644\u0633\u064a\u0628\u0631\u0627\u0646\u064a"
     )).strip()[:120]
@@ -577,8 +579,10 @@ def add_lecture_from_bot(payload: dict = Body(...), api_key: str | None = Header
         raise HTTPException(status_code=422, detail="Invalid Telegram backup URL.")
     if not telegram_file_id:
         telegram_file_id = hashlib.sha256(f"{original_file_name}|{drive_url}".encode("utf-8")).hexdigest()
+    if not telegram_file_unique_id:
+        telegram_file_unique_id = dedupe_telegram_id or telegram_file_id
     safe_stem = re.sub(r"[^A-Za-z0-9_-]+", "_", Path(original_file_name).stem).strip("_") or "lecture"
-    unique_suffix = hashlib.sha256(telegram_file_id.encode("utf-8")).hexdigest()[:12]
+    unique_suffix = hashlib.sha256(telegram_file_unique_id.encode("utf-8")).hexdigest()[:12]
     file_name = f"{safe_stem}_{unique_suffix}.pdf"
 
     subject_id = None
@@ -616,7 +620,9 @@ def add_lecture_from_bot(payload: dict = Body(...), api_key: str | None = Header
             )
             _sync_subject_catalog(conn)
             existing = conn.execute(
-                "SELECT id,drive_url,drive_file_id,subject_id,department,department_id FROM materials WHERE telegram_file_id=?", (telegram_file_id,)
+                "SELECT id,drive_url,drive_file_id,subject_id,department,department_id FROM materials "
+                "WHERE telegram_file_unique_id=? OR telegram_file_id=?",
+                (telegram_file_unique_id, dedupe_telegram_id or telegram_file_id),
             ).fetchone()
             if existing:
                 return {"status": "success", "duplicate": True, "database_saved": True,
@@ -628,13 +634,13 @@ def add_lecture_from_bot(payload: dict = Body(...), api_key: str | None = Header
             cursor = conn.execute(
                 """INSERT INTO materials
                    (title,file_name,uploaded_by,created_at,subject,department,department_id,group_name,file_url,upload_date,
-                    telegram_file_id,drive_url,drive_download_url,telegram_backup_url,topic_id,file_size,drive_file_id,subject_id)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    telegram_file_id,telegram_file_unique_id,drive_url,drive_download_url,telegram_backup_url,topic_id,file_size,drive_file_id,subject_id)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     title, file_name, "telegram-lecture-bot", upload_date, subject,
                     department, department_id_for(department),
                     str(payload.get("group_name") or "")[:40],
-                    drive_url, upload_date, telegram_file_id, drive_url,
+                    drive_url, upload_date, telegram_file_id, telegram_file_unique_id, drive_url,
                     drive_download_url or None, telegram_backup_url,
                     int(payload["topic_id"]) if payload.get("topic_id") is not None else None,
                     int(payload["file_size"]) if payload.get("file_size") is not None else None,
@@ -678,12 +684,14 @@ def lecture_record_exists(payload: dict = Body(...), api_key: str | None = Heade
         raise HTTPException(status_code=401, detail="Invalid API Key")
 
     telegram_file_id = str(payload.get("telegram_file_id") or "").strip()
+    telegram_file_unique_id = str(payload.get("telegram_file_unique_id") or "").strip()
     if not telegram_file_id:
         raise HTTPException(status_code=422, detail="Telegram file ID is required.")
     ensure_materials_table()
     with closing(sqlite3.connect(DATABASE_PATH)) as conn:
         row = conn.execute(
-            "SELECT id FROM materials WHERE telegram_file_id=?", (telegram_file_id,)
+            "SELECT id FROM materials WHERE telegram_file_unique_id=? OR telegram_file_id=?",
+            (telegram_file_unique_id or telegram_file_id, telegram_file_id),
         ).fetchone()
     return {"status": "success", "exists": row is not None}
 
@@ -1037,7 +1045,7 @@ def list_materials(
                 "subject": row_dict.get("subject") or row_dict.get("subject_name") or "الأمن السيبراني",
                 "title": row_dict.get("title") or row_dict.get("file_name") or "ملزمة دراسية",
                 "file_name": row_dict.get("file_name") or "",
-                "file_url": row_dict.get("file_url") or "#",
+                "file_url": f"/materials/{row_dict.get('id')}/download" if row_dict.get("id") is not None else (row_dict.get("file_url") or "#"),
                 "drive_url": row_dict.get("drive_url") or "",
                 "drive_download_url": row_dict.get("drive_download_url") or "",
                 "download_url": f"/materials/{row_dict.get('id')}/download" if row_dict.get("id") is not None else (row_dict.get("drive_download_url") or row_dict.get("file_url") or "#"),
@@ -1095,6 +1103,17 @@ async def upload_lecture_from_main_view(
         stored_path.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail="Subject is required.")
     department_id = department_id_for(department_name)
+    cloud_record = {}
+    try:
+        from drive_service import upload_pdf_to_drive
+        cloud_record = await run_in_threadpool(
+            upload_pdf_to_drive, contents, Path(file.filename or stored_name).name,
+            department_name, clean_subject,
+        )
+    except Exception:
+        # Retain the local upload if Drive credentials are unavailable; the
+        # standalone sync script can retry it later.
+        logger.warning("Drive upload unavailable for locally uploaded material %s", stored_name, exc_info=True)
     try:
         with closing(sqlite3.connect(DATABASE_PATH)) as conn:
             subject_id, clean_subject = _resolve_subject_id(conn, clean_subject, department_name)
@@ -1102,24 +1121,91 @@ async def upload_lecture_from_main_view(
             cursor = conn.execute(
                 """INSERT INTO materials
                    (title,file_name,uploaded_by,created_at,subject,department,department_id,group_name,
-                    file_url,upload_date,drive_url,drive_download_url,file_size,subject_id)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    file_url,upload_date,drive_url,drive_download_url,file_size,subject_id,drive_file_id)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (clean_title, stored_name, actor.get("email"), created_at, clean_subject, department_name,
-                 department_id, group_name, file_url, created_at, file_url, file_url, len(contents), subject_id),
+                 department_id, group_name, file_url, created_at,
+                 cloud_record.get("web_view_link") or file_url,
+                 cloud_record.get("direct_download_link") or file_url,
+                 len(contents), subject_id, cloud_record.get("file_id")),
             )
             material_id = cursor.lastrowid
             conn.execute(
                 """INSERT OR REPLACE INTO lectures
                    (id,title,subject,department,department_id,drive_url,created_at,subject_id)
                    VALUES (?,?,?,?,?,?,?,?)""",
-                (material_id, clean_title, clean_subject, department_name, department_id, file_url, created_at, subject_id),
+                (material_id, clean_title, clean_subject, department_name, department_id,
+                 cloud_record.get("web_view_link") or file_url, created_at, subject_id),
             )
             conn.commit()
     except Exception:
         stored_path.unlink(missing_ok=True)
         logger.exception("Could not save uploaded lecture metadata")
         raise HTTPException(status_code=500, detail="Could not save the uploaded lecture.")
-    return {"status": "success", "id": material_id, "title": clean_title, "file_url": file_url}
+    return {"status": "success", "id": material_id, "title": clean_title,
+            "file_url": f"/materials/{material_id}/download",
+            "cloud_synced": bool(cloud_record)}
+
+
+async def cloud_material_response(material_id: int, filename: str, drive_url: str,
+                                  drive_download_url: str, telegram_file_id: str):
+    """Fetch a material from a trusted cloud provider when its local copy is absent."""
+    attempted = False
+    download_url = str(drive_download_url or "").strip()
+    view_url = str(drive_url or "").strip()
+    parsed_download = urlparse(download_url)
+    if parsed_download.scheme != "https" or parsed_download.hostname not in {"drive.google.com", "docs.google.com"}:
+        download_url = ""
+        parsed = urlparse(view_url)
+        if parsed.hostname in {"drive.google.com", "docs.google.com"}:
+            file_id = (parse_qs(parsed.query).get("id") or [""])[0]
+            if not file_id:
+                match = re.search(r"/file/d/([^/]+)", parsed.path)
+                file_id = match.group(1) if match else ""
+            if file_id:
+                download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    parsed_download = urlparse(download_url)
+    if parsed_download.scheme == "https" and parsed_download.hostname in {"drive.google.com", "docs.google.com"}:
+        attempted = True
+        try:
+            async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+                upstream = await client.get(download_url)
+            upstream.raise_for_status()
+            if "pdf" not in upstream.headers.get("content-type", "").lower() and not upstream.content.startswith(b"%PDF-"):
+                raise ValueError("Drive response was not a PDF")
+            return Response(content=upstream.content, media_type="application/pdf", headers={
+                "Content-Disposition": f"inline; filename=lecture.pdf; filename*=UTF-8''{quote(Path(filename).name)}"
+            })
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.warning("Google Drive fallback failed for material %s: %s", material_id, exc)
+
+    token = TELEGRAM_BOT_TOKEN
+    telegram_id = str(telegram_file_id or "").strip()
+    if token and telegram_id and not re.fullmatch(r"[a-fA-F0-9]{64}", telegram_id):
+        attempted = True
+        try:
+            async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+                metadata_response = await client.get(
+                    f"https://api.telegram.org/bot{token}/getFile", params={"file_id": telegram_id}
+                )
+                metadata_response.raise_for_status()
+                metadata = metadata_response.json()
+                file_path = metadata.get("result", {}).get("file_path") if metadata.get("ok") else None
+                if not file_path:
+                    raise ValueError("Telegram did not return a file path")
+                file_response = await client.get(f"https://api.telegram.org/file/bot{token}/{file_path}")
+                file_response.raise_for_status()
+                if not file_response.content.startswith(b"%PDF-"):
+                    raise ValueError("Telegram response was not a PDF")
+            return Response(content=file_response.content, media_type="application/pdf", headers={
+                "Content-Disposition": f"inline; filename=lecture.pdf; filename*=UTF-8''{quote(Path(filename).name)}"
+            })
+        except (httpx.HTTPError, ValueError, KeyError) as exc:
+            logger.warning("Telegram fallback failed for material %s: %s", material_id, exc)
+
+    if attempted:
+        raise HTTPException(status_code=502, detail="The cloud copy is temporarily unavailable.")
+    raise HTTPException(status_code=404, detail="No local or cloud copy is available for this material.")
 
 
 @app.get("/materials/{material_id}/download")
@@ -1131,7 +1217,7 @@ async def download_material_pdf(material_id: int, request: Request):
     with closing(sqlite3.connect(DATABASE_PATH)) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
-            "SELECT file_name,title,file_url,drive_url,drive_download_url,department_id FROM materials WHERE id=?",
+            "SELECT file_name,title,file_url,drive_url,drive_download_url,telegram_file_id,department_id FROM materials WHERE id=?",
             (material_id,),
         ).fetchone()
     if row is None:
@@ -1142,43 +1228,41 @@ async def download_material_pdf(material_id: int, request: Request):
     filename = str(row["file_name"] or row["title"] or f"lecture-{material_id}.pdf")
     local_url = str(row["file_url"] or "")
     local_path = urlparse(local_url).path
-    if local_path.startswith("/static/materials/"):
-        candidate = (MATERIALS_DIR / Path(local_path).name).resolve()
-        if candidate.is_file() and candidate.parent == MATERIALS_DIR.resolve():
-            return FileResponse(candidate, media_type="application/pdf", filename=filename)
+    local_name = Path(local_path).name if local_path.startswith("/static/materials/") else Path(filename).name
+    candidate = (MATERIALS_DIR / local_name).resolve()
+    if candidate.is_file() and candidate.parent == MATERIALS_DIR.resolve():
+        return FileResponse(candidate, media_type="application/pdf", filename=Path(filename).name)
+    return await cloud_material_response(
+        material_id, filename,
+        row["drive_url"] if is_google_drive_url(row["drive_url"]) else local_url,
+        row["drive_download_url"], row["telegram_file_id"]
+    )
 
-    download_url = str(row["drive_download_url"] or "").strip()
-    drive_url = str(row["drive_url"] or local_url or "").strip()
-    if not download_url:
-        parsed = urlparse(drive_url)
-        file_id = (parse_qs(parsed.query).get("id") or [""])[0]
-        if not file_id:
-            match = re.search(r"/file/d/([^/]+)", parsed.path)
-            file_id = match.group(1) if match else ""
-        if file_id:
-            download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
 
-    parsed_download = urlparse(download_url)
-    if parsed_download.scheme != "https" or parsed_download.hostname not in {"drive.google.com", "docs.google.com"}:
-        raise HTTPException(status_code=404, detail="A downloadable PDF URL is not available.")
+@app.get("/static/materials/{file_name}")
+async def download_legacy_material(file_name: str):
+    """Keep older stored /static/materials links working after local files move."""
+    if Path(file_name).name != file_name or file_name in {"", ".", ".."}:
+        raise HTTPException(status_code=404, detail="Material not found.")
+    with closing(sqlite3.connect(DATABASE_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT id,file_name,title,file_url,drive_url,drive_download_url,telegram_file_id FROM materials WHERE file_name=?",
+            (file_name,),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Material not found.")
+    candidate = (MATERIALS_DIR / file_name).resolve()
+    if candidate.parent == MATERIALS_DIR.resolve() and candidate.is_file():
+        return FileResponse(candidate, media_type="application/pdf", filename=Path(file_name).name)
+    return await cloud_material_response(
+        row["id"], row["file_name"] or row["title"] or file_name,
+        row["drive_url"] if is_google_drive_url(row["drive_url"]) else row["file_url"],
+        row["drive_download_url"], row["telegram_file_id"],
+    )
 
-    try:
-        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
-            upstream = await client.get(download_url)
-        upstream.raise_for_status()
-        content_type = upstream.headers.get("content-type", "").lower()
-        if "pdf" not in content_type and not upstream.content.startswith(b"%PDF-"):
-            raise HTTPException(status_code=502, detail="Google Drive did not return a PDF file.")
-        return Response(
-            content=upstream.content,
-            media_type="application/pdf",
-            headers={"Content-Disposition": f"inline; filename=lecture.pdf; filename*=UTF-8''{quote(Path(filename).name)}"},
-        )
-    except HTTPException:
-        raise
-    except httpx.HTTPError as exc:
-        logger.warning("Could not proxy PDF download for lecture %s: %s", material_id, exc)
-        raise HTTPException(status_code=502, detail="Could not download this PDF from Google Drive.") from exc
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # ط°ط§ظƒط±ط© ظ…ط¤ظ‚طھط© ظ„ط­ظپط¸ ط§ظ„ظ€ OTP ط§ظ„ط®ط§طµ ط¨ظƒظ„ ظ‚ط§ط¹ط©
 ACTIVE_OTPS = {}

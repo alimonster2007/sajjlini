@@ -38,6 +38,8 @@ Locally, set `ATTENDANCE_BOT_TOKEN` in `.env`, then save the attendance group's 
 
 The persistent disk is necessary for this app's SQLite database and uploaded files; Render's default filesystem is ephemeral. The Blueprint's `starter` service plan with a disk is a paid configuration, so check the current plan and disk charges before creating it. Keep the SQLite web service to one instance. The Telegram worker runs separately and is the sole polling owner.
 
+The API now attempts a Google Drive upload when an administrator uploads a PDF. To backfill older rows that only have `/static/materials/` files, run `python scripts/sync_to_cloud.py` from a checkout that has the matching SQLite database, material files, and Google OAuth token configured. It updates `drive_url`, `drive_download_url`, `drive_file_id`, and the retrievable Telegram `telegram_file_id` when an archive destination is configured. It can archive PDFs to Telegram when `CLOUD_SYNC_TELEGRAM_CHAT_ID` is set alongside `TELEGRAM_BOT_TOKEN`. Keep that Telegram destination dedicated to archival because each backfilled document is posted there once. Download routes prefer a local copy, then fall back to Drive and Telegram.
+
 After the first deploy, Render can automatically deploy commits pushed to the connected branch. The database is initialized when the FastAPI module loads. The local `attendance.db`, existing attendance records, snapshots, and ignored PDFs are not copied to the cloud; transfer any data you need through a controlled migration process rather than committing those files.
 
 Telegram polling diagnostics were removed from the FastAPI service. The bot worker logs polling and ingestion failures to its process output.

@@ -7,6 +7,9 @@ import traceback
 import unicodedata
 from pathlib import Path
 from urllib.parse import quote
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().with_name(".env"), override=False)
 
 
 SCOPES = [
@@ -18,7 +21,7 @@ TOKEN_FILE = Path(os.getenv(
 )).expanduser()
 if not TOKEN_FILE.is_absolute():
     TOKEN_FILE = Path(__file__).resolve().parent / TOKEN_FILE
-ROOT_ID = "12Dz6_w7C3OAZmyOHx5kq1L8okOYla_7A"
+ROOT_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "12Dz6_w7C3OAZmyOHx5kq1L8okOYla_7A").strip()
 DEFAULT_PARENT_ID = ROOT_ID
 ROOT_FOLDER_ID = ROOT_ID
 DEFAULT_ROOT_FOLDER_ID = ROOT_ID
