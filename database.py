@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).with_name(".env"), override=False)
 
-DEFAULT_DATABASE_PATH = Path(__file__).with_name("attendance.db")
+DEFAULT_DATABASE_PATH = Path(__file__).with_name("database.db")
 
 
 def resolve_database_path(db_path=None) -> str:
@@ -77,18 +77,20 @@ def ensure_user_schema(conn: sqlite3.Connection) -> None:
         id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL,
         password TEXT NOT NULL, role TEXT NOT NULL, class_id TEXT, device_uuid TEXT,
         department TEXT, group_name TEXT, display_role TEXT, college TEXT, stage TEXT,
-        is_first_login INTEGER NOT NULL DEFAULT 1
+        is_first_login INTEGER NOT NULL DEFAULT 1, reference_face_path TEXT, password_hash TEXT
     )''')
     columns = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
     additions = {
         "department": "TEXT", "group_name": "TEXT", "display_role": "TEXT",
         "department_id": "TEXT", "created_at": "DATETIME",
         "college": "TEXT", "stage": "TEXT", "is_first_login": "INTEGER NOT NULL DEFAULT 1",
+        "reference_face_path": "TEXT", "password_hash": "TEXT",
     }
     for column, declaration in additions.items():
         if column not in columns:
             conn.execute(f"ALTER TABLE users ADD COLUMN {column} {declaration}")
     conn.execute("UPDATE users SET department_id=COALESCE(department_id,class_id)")
+    conn.execute("UPDATE users SET password_hash=COALESCE(password_hash,password)")
 
 
 def seed_doctor_accounts(conn: sqlite3.Connection) -> None:
@@ -105,16 +107,16 @@ def seed_doctor_accounts(conn: sqlite3.Connection) -> None:
         if existing is None:
             conn.execute(
                 """INSERT INTO users
-                   (name,email,password,role,class_id,department,group_name,is_first_login)
-                   VALUES (?,?,?,'doctor',?,?,NULL,1)""",
-                (name, email, password_hash, department, department),
+                   (name,email,password,password_hash,role,class_id,department,group_name,is_first_login)
+                   VALUES (?,?,?,?,'doctor',?,?,NULL,1)""",
+                (name, email, password_hash, password_hash, department, department),
             )
         else:
             conn.execute(
                 """UPDATE users SET name=?, role='doctor', class_id=?,
                    department=?, group_name=NULL,
-                   password=COALESCE(?,password) WHERE lower(email)=lower(?)""",
-                (name, department, department, password_hash, email),
+                   password=COALESCE(?,password),password_hash=COALESCE(?,password_hash) WHERE lower(email)=lower(?)""",
+                (name, department, department, password_hash, password_hash, email),
             )
 
 

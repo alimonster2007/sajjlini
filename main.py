@@ -34,6 +34,7 @@ DATABASE_PATH = Path(resolve_database_path())
 DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
 MATERIALS_DIR = Path(os.getenv("MATERIALS_DIR", str(Path(__file__).with_name("static") / "materials"))).expanduser()
 ATTENDANCE_SNAPSHOT_DIR = Path(os.getenv("ATTENDANCE_SNAPSHOT_DIR", str(Path(__file__).with_name("attendance_snapshots")))).expanduser()
+REFERENCE_FACE_DIR = Path(os.getenv("REFERENCE_FACE_DIR", str(ATTENDANCE_SNAPSHOT_DIR / "reference_faces"))).expanduser()
 MATERIALS_DIR.mkdir(parents=True, exist_ok=True)
 ATTENDANCE_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1364,60 +1365,102 @@ TOPIC_SUBJECT_MAP = {
 def ensure_academic_schema():
     conn = sqlite3.connect(DATABASE_PATH)
     cursor = conn.cursor()
-    user_columns = {row[1] for row in cursor.execute("PRAGMA table_info(users)").fetchall()}
-    if "department" not in user_columns:
+    def safe_execute(statement: str, params=()):
+        try:
+            return cursor.execute(statement, params)
+        except sqlite3.OperationalError:
+            logger.warning("Ignoring SQLite migration error for statement: %s", statement.splitlines()[0][:120])
+            return None
+
+    def table_columns(table_name: str) -> set[str]:
+        try:
+            return {row[1] for row in cursor.execute(f'PRAGMA table_info("{table_name}")').fetchall()}
+        except sqlite3.OperationalError:
+            return set()
+
+    safe_execute("""CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL, role TEXT NOT NULL, class_id TEXT, device_uuid TEXT,
+        department TEXT, group_name TEXT, display_role TEXT, department_id TEXT,
+        created_at DATETIME, college TEXT, stage TEXT,
+        is_first_login INTEGER NOT NULL DEFAULT 1, reference_face_path TEXT, password_hash TEXT
+    )""")
+
+    # Attendance endpoints expect this table even on a brand-new/partial DB.
+    # Keep creation before column migrations so startup never depends on a
+    # separate manual database initialization step.
+    safe_execute("""CREATE TABLE IF NOT EXISTS attendance (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        student_email TEXT NOT NULL,
+        class_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        department TEXT,
+        group_name TEXT,
+        snapshot_url TEXT
+    )""")
+
+    try:
         cursor.execute("ALTER TABLE users ADD COLUMN department TEXT")
-    if "group_name" not in user_columns:
-        cursor.execute("ALTER TABLE users ADD COLUMN group_name TEXT")
-    if "department_id" not in user_columns:
-        cursor.execute("ALTER TABLE users ADD COLUMN department_id TEXT")
-    if "created_at" not in user_columns:
-        cursor.execute("ALTER TABLE users ADD COLUMN created_at DATETIME")
-    if "display_role" not in user_columns:
-        cursor.execute("ALTER TABLE users ADD COLUMN display_role TEXT")
-    if "college" not in user_columns:
-        cursor.execute("ALTER TABLE users ADD COLUMN college TEXT")
-    if "stage" not in user_columns:
-        cursor.execute("ALTER TABLE users ADD COLUMN stage TEXT")
-    if "is_first_login" not in user_columns:
-        cursor.execute("ALTER TABLE users ADD COLUMN is_first_login INTEGER NOT NULL DEFAULT 1")
-    attendance_columns = {row[1] for row in cursor.execute("PRAGMA table_info(attendance)").fetchall()}
-    if "department" not in attendance_columns:
-        cursor.execute("ALTER TABLE attendance ADD COLUMN department TEXT")
-    if "group_name" not in attendance_columns:
-        cursor.execute("ALTER TABLE attendance ADD COLUMN group_name TEXT")
-    if "snapshot_url" not in attendance_columns:
-        cursor.execute("ALTER TABLE attendance ADD COLUMN snapshot_url TEXT")
-    cursor.execute("UPDATE users SET department = ? WHERE department IS NULL AND class_id IN ('Cybersecurity','CyberSecurity')", (DEPARTMENTS[0],))
-    cursor.execute("UPDATE users SET department = ? WHERE department IS NULL AND lower(role) NOT IN ('admin','super_admin')", (DEPARTMENTS[0],))
-    cursor.execute("UPDATE users SET department_id = COALESCE(department_id, class_id)")
-    cursor.execute("UPDATE users SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP)")
-    cursor.execute("UPDATE users SET group_name = 'A' WHERE group_name IS NULL AND lower(role) NOT IN ('admin','super_admin')")
-    cursor.execute("UPDATE attendance SET department = ? WHERE department IS NULL", (DEPARTMENTS[0],))
-    cursor.execute("UPDATE attendance SET group_name = 'A' WHERE group_name IS NULL")
-    cursor.execute("""CREATE TABLE IF NOT EXISTS lecture_schedule (
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN class_id TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+    user_additions = {
+        "name": "TEXT", "email": "TEXT", "password": "TEXT", "role": "TEXT",
+        "group_name": "TEXT", "department_id": "TEXT", "device_uuid": "TEXT",
+        "created_at": "DATETIME", "display_role": "TEXT", "college": "TEXT",
+        "stage": "TEXT", "is_first_login": "INTEGER NOT NULL DEFAULT 1",
+        "reference_face_path": "TEXT", "password_hash": "TEXT",
+    }
+    user_columns = table_columns("users")
+    for column, declaration in user_additions.items():
+        if column not in user_columns:
+            safe_execute(f'ALTER TABLE users ADD COLUMN "{column}" {declaration}')
+
+    attendance_additions = {"department": "TEXT", "group_name": "TEXT", "snapshot_url": "TEXT"}
+    attendance_columns = table_columns("attendance")
+    for column, declaration in attendance_additions.items():
+        if column not in attendance_columns:
+            safe_execute(f'ALTER TABLE attendance ADD COLUMN "{column}" {declaration}')
+
+    for statement, params in (
+        ("UPDATE users SET department = ? WHERE department IS NULL AND class_id IN ('Cybersecurity','CyberSecurity')", (DEPARTMENTS[0],)),
+        ("UPDATE users SET department = ? WHERE department IS NULL AND lower(role) NOT IN ('admin','super_admin')", (DEPARTMENTS[0],)),
+        ("UPDATE users SET department_id = COALESCE(department_id, class_id)", ()),
+        ("UPDATE users SET password_hash = COALESCE(password_hash, password)", ()),
+        ("UPDATE users SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP)", ()),
+        ("UPDATE users SET group_name = 'A' WHERE group_name IS NULL AND lower(role) NOT IN ('admin','super_admin')", ()),
+    ):
+        safe_execute(statement, params)
+    safe_execute("UPDATE attendance SET department = ? WHERE department IS NULL", (DEPARTMENTS[0],))
+    safe_execute("UPDATE attendance SET group_name = 'A' WHERE group_name IS NULL")
+    safe_execute("""CREATE TABLE IF NOT EXISTS lecture_schedule (
         id INTEGER PRIMARY KEY AUTOINCREMENT, weekday INTEGER NOT NULL, start_time TEXT NOT NULL,
         department TEXT NOT NULL, department_id TEXT, group_name TEXT NOT NULL, subject TEXT NOT NULL, is_active INTEGER NOT NULL DEFAULT 1,
         end_time TEXT, lecture_type TEXT, instructor TEXT, doctor_name TEXT, professor_name TEXT, room TEXT,
         UNIQUE(weekday, start_time, department, group_name)
     )""")
-    schedule_columns = {row[1] for row in cursor.execute("PRAGMA table_info(lecture_schedule)").fetchall()}
+    schedule_columns = table_columns("lecture_schedule")
     for column in ("end_time", "lecture_type", "instructor", "doctor_name", "professor_name", "room", "stage", "doctor_email", "department_code", "department_id"):
         if column not in schedule_columns:
-            cursor.execute(f"ALTER TABLE lecture_schedule ADD COLUMN {column} TEXT")
-    cursor.execute("UPDATE lecture_schedule SET doctor_name=COALESCE(NULLIF(trim(doctor_name),''),NULLIF(trim(instructor),''),professor_name)")
-    cursor.execute("UPDATE lecture_schedule SET instructor=COALESCE(NULLIF(trim(instructor),''),doctor_name,professor_name)")
-    cursor.execute("UPDATE lecture_schedule SET professor_name=COALESCE(NULLIF(trim(professor_name),''),doctor_name,instructor)")
-    cursor.execute("""CREATE TABLE IF NOT EXISTS schedule_overrides (
+            safe_execute(f"ALTER TABLE lecture_schedule ADD COLUMN {column} TEXT")
+    safe_execute("UPDATE lecture_schedule SET doctor_name=COALESCE(NULLIF(trim(doctor_name),''),NULLIF(trim(instructor),''),professor_name)")
+    safe_execute("UPDATE lecture_schedule SET instructor=COALESCE(NULLIF(trim(instructor),''),doctor_name,professor_name)")
+    safe_execute("UPDATE lecture_schedule SET professor_name=COALESCE(NULLIF(trim(professor_name),''),doctor_name,instructor)")
+    safe_execute("""CREATE TABLE IF NOT EXISTS schedule_overrides (
         schedule_id INTEGER NOT NULL, lecture_date TEXT NOT NULL, new_time TEXT,
         status TEXT NOT NULL DEFAULT 'active', PRIMARY KEY(schedule_id, lecture_date),
         FOREIGN KEY(schedule_id) REFERENCES lecture_schedule(id)
     )""")
-    cursor.execute("""CREATE TABLE IF NOT EXISTS scheduled_otp_log (
+    safe_execute("""CREATE TABLE IF NOT EXISTS scheduled_otp_log (
         schedule_id INTEGER NOT NULL, lecture_date TEXT NOT NULL, sent_at TEXT NOT NULL,
         PRIMARY KEY(schedule_id, lecture_date)
     )""")
-    cursor.execute("""CREATE TABLE IF NOT EXISTS schedules (
+    safe_execute("""CREATE TABLE IF NOT EXISTS schedules (
         id INTEGER PRIMARY KEY,
         department_id TEXT NOT NULL CHECK(department_id IN ('Cybersecurity','AI')),
         group_name TEXT NOT NULL CHECK(group_name IN ('Group A','Group B')),
@@ -1428,9 +1471,33 @@ def ensure_academic_schema():
         doctor_name TEXT,
         room_number TEXT
     )""")
-    _clean_department_records(conn)
-    _sync_schedule_contract(conn)
-    for user_row in cursor.execute("SELECT id,department_id,class_id,department FROM users").fetchall():
+    safe_execute("""CREATE TABLE IF NOT EXISTS password_reset_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    )""")
+    reset_columns = table_columns("password_reset_requests")
+    for column, declaration in {
+        "user_id": "INTEGER", "status": "TEXT NOT NULL DEFAULT 'pending'",
+        "created_at": "DATETIME",
+    }.items():
+        if column not in reset_columns:
+            safe_execute(f'ALTER TABLE password_reset_requests ADD COLUMN "{column}" {declaration}')
+    try:
+        _clean_department_records(conn)
+    except sqlite3.OperationalError:
+        logger.warning("Skipping department cleanup during SQLite schema migration", exc_info=True)
+    try:
+        _sync_schedule_contract(conn)
+    except sqlite3.OperationalError:
+        logger.warning("Skipping schedule synchronization during SQLite schema migration", exc_info=True)
+    try:
+        user_rows = cursor.execute("SELECT id,department_id,class_id,department FROM users").fetchall()
+    except sqlite3.OperationalError:
+        user_rows = []
+    for user_row in user_rows:
         canonical_id = (_canonical_department_id(user_row[1], user_row[3])
                         or _canonical_department_id(user_row[2], user_row[3]))
         if canonical_id:
@@ -1438,18 +1505,24 @@ def ensure_academic_schema():
             class_id = user_row[2]
             if _canonical_department_id(class_id) is not None:
                 class_id = canonical_id
-            cursor.execute(
+            safe_execute(
                 "UPDATE users SET department_id=?,department=?,class_id=? WHERE id=?",
                 (canonical_id, canonical_name, class_id, user_row[0]),
             )
-    cursor.execute("""INSERT INTO users (name,email,password,role,class_id,device_uuid,department,group_name)
+    safe_execute("""INSERT INTO users (name,email,password,role,class_id,device_uuid,department,group_name)
         VALUES (?,?,'student123','student','Cybersecurity',NULL,?,?)
         ON CONFLICT(email) DO UPDATE SET name=excluded.name, password=excluded.password, role='student',
         class_id='Cybersecurity', department=excluded.department, group_name=excluded.group_name""",
         ("علي علي", "student@uob.edu.iq", DEPARTMENTS[0], "B"))
-    conn.commit()
+    try:
+        conn.commit()
+    except sqlite3.OperationalError:
+        logger.warning("Could not commit all optional SQLite schema migrations", exc_info=True)
     conn.close()
-    ensure_materials_table()
+    try:
+        ensure_materials_table()
+    except sqlite3.OperationalError:
+        logger.warning("Skipping materials schema initialization during SQLite migration", exc_info=True)
 
 def _delete_material_rows(conn: sqlite3.Connection, material_ids: list[int]) -> int:
     if not material_ids:
@@ -2311,11 +2384,110 @@ def change_password(payload: dict = Body(...)):
         row = conn.execute("SELECT password FROM users WHERE lower(email)=?", (email,)).fetchone()
         if not row or not verify_password(old_password, row[0]):
             return {"status": "error", "message": "كلمة المرور الحالية غير صحيحة."}
-        conn.execute("UPDATE users SET password=?, is_first_login=0 WHERE lower(email)=?", (hash_password(new_password), email))
+        new_password_hash = hash_password(new_password)
+        conn.execute("UPDATE users SET password=?,password_hash=? WHERE lower(email)=?", (new_password_hash, new_password_hash, email))
         conn.commit()
         return {"status": "success"}
     finally:
         conn.close()
+
+
+@app.post("/password-reset-requests")
+def create_password_reset_request(payload: dict = Body(...)):
+    email = str(payload.get("email") or "").strip().casefold()
+    ensure_academic_schema()
+    with closing(sqlite3.connect(DATABASE_PATH)) as conn:
+        user = conn.execute("SELECT id FROM users WHERE lower(email)=?", (email,)).fetchone()
+        if user:
+            conn.execute(
+                "INSERT INTO password_reset_requests(user_id,status) VALUES(?, 'pending')",
+                (user[0],),
+            )
+            conn.commit()
+    # Keep the response the same whether or not the account exists.
+    return {"status": "success", "message": "تم استلام الطلب للمراجعة من الإدارة."}
+
+
+@app.get("/admin/password-reset-requests")
+def list_password_reset_requests(request: Request):
+    require_admin(request)
+    ensure_academic_schema()
+    with closing(sqlite3.connect(DATABASE_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """SELECT reset.id,reset.user_id,reset.status,reset.created_at,user.name,user.email
+               FROM password_reset_requests AS reset JOIN users AS user ON user.id=reset.user_id
+               ORDER BY reset.created_at,reset.id"""
+        ).fetchall()
+    return {"status": "success", "requests": [dict(row) for row in rows]}
+
+
+@app.post("/admin/password-reset-requests/{request_id}/approve")
+def approve_password_reset_request(request_id: int, request: Request, payload: dict = Body(...)):
+    require_admin(request)
+    new_password = str(payload.get("new_password") or "")
+    if len(new_password) < 6 or new_password.casefold() == "b2026":
+        raise HTTPException(status_code=400, detail="Choose a non-default password with at least 6 characters.")
+    password_hash = hash_password(new_password)
+    ensure_academic_schema()
+    with closing(sqlite3.connect(DATABASE_PATH)) as conn:
+        row = conn.execute(
+            "SELECT user_id,status FROM password_reset_requests WHERE id=?", (request_id,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Password reset request not found.")
+        if row[1] != "pending":
+            raise HTTPException(status_code=409, detail="Password reset request is no longer pending.")
+        conn.execute("UPDATE users SET password=?,password_hash=?,is_first_login=1 WHERE id=?", (password_hash, password_hash, row[0]))
+        conn.execute("UPDATE password_reset_requests SET status='approved' WHERE id=?", (request_id,))
+        conn.commit()
+    return {"status": "success"}
+
+
+@app.post("/register-reference-face")
+def register_reference_face(request: Request, payload: dict = Body(...)):
+    actor = require_authenticated_user(request)
+    image_data = str(payload.get("image_base64") or "")
+    try:
+        header, encoded = image_data.split(",", 1) if "," in image_data else ("", image_data)
+        if header and header not in ("data:image/jpeg;base64", "data:image/png;base64"):
+            raise ValueError("Unsupported image type")
+        if not encoded or len(encoded) > 6_000_000:
+            raise ValueError("Image is empty or too large")
+        image_bytes = base64.b64decode(encoded, validate=True)
+        if not image_bytes or len(image_bytes) > 4_500_000:
+            raise ValueError("Image is empty or too large")
+        if header == "data:image/png;base64" and not image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ValueError("Invalid PNG image")
+        if header == "data:image/jpeg;base64" and not image_bytes.startswith(b"\xff\xd8\xff"):
+            raise ValueError("Invalid JPEG image")
+    except (ValueError, binascii.Error):
+        raise HTTPException(status_code=400, detail="Capture a valid face photo and try again.")
+
+    ensure_academic_schema()
+    REFERENCE_FACE_DIR.mkdir(parents=True, exist_ok=True)
+    suffix = ".png" if header == "data:image/png;base64" else ".jpg"
+    safe_name = f"{int(actor['id'])}_{secrets.token_hex(16)}{suffix}"
+    image_path = REFERENCE_FACE_DIR / safe_name
+    image_path.write_bytes(image_bytes)
+    try:
+        with closing(sqlite3.connect(DATABASE_PATH)) as conn:
+            user = conn.execute(
+                "SELECT is_first_login,reference_face_path FROM users WHERE id=?", (actor["id"],)
+            ).fetchone()
+            if user is None:
+                raise HTTPException(status_code=404, detail="Account not found.")
+            if not bool(user[0]):
+                raise HTTPException(status_code=409, detail="First-login face registration is already complete.")
+            conn.execute(
+                "UPDATE users SET reference_face_path=?,is_first_login=0 WHERE id=?",
+                (safe_name, actor["id"]),
+            )
+            conn.commit()
+    except Exception:
+        image_path.unlink(missing_ok=True)
+        raise
+    return {"status": "success", "is_first_login": False}
 
 def doctor_user(email: str):
     conn = sqlite3.connect(DATABASE_PATH)
@@ -2676,13 +2848,26 @@ def student_checkin(
     conn = sqlite3.connect(DATABASE_PATH)
     cursor = conn.cursor()
     ensure_academic_schema()
-    cursor.execute("SELECT role, department, group_name, class_id, device_uuid FROM users WHERE email = ?", (email,))
+    cursor.execute("SELECT role, department, group_name, class_id, device_uuid, reference_face_path FROM users WHERE email = ?", (email,))
     user = cursor.fetchone()
     if not user or user[0] not in ('student', *REPRESENTATIVE_ROLES):
         conn.close()
         return {"status": "error", "message": "حساب الطالب غير موجود أو غير مخول لتسجيل الحضور."}
     department_name, group_name = normalize_department_name(user[1]), normalize_group_name(user[2] or "A")
     class_id = user[3] or "CyberSecurity"
+    is_representative = str(user[0]).casefold() in REPRESENTATIVE_ROLES
+    if not is_representative and not snapshot_base64:
+        conn.close()
+        return {"status": "error", "message": "Please capture a photo to verify attendance."}
+    if not is_representative and not user[5]:
+        conn.close()
+        return {"status": "error", "message": "Register a reference face before confirming attendance."}
+    if not is_representative:
+        # No face embedding/model is configured in this application. Never
+        # accept a supplied image as proof of identity without comparison.
+        conn.close()
+        logger.error("Attendance face verification unavailable: no comparison engine is configured")
+        return {"status": "error", "message": "تعذر التحقق من تطابق الوجه لأن خدمة التحقق غير مهيأة."}
 
     otp_key = f"{department_name}|{group_name}"
     active_otp = ACTIVE_OTPS.get(otp_key)
@@ -2702,9 +2887,7 @@ def student_checkin(
     remote_ip = request.client.host if request.client else ""
     try:
         client_ip = ipaddress.ip_address(remote_ip)
-        local_dev_networks = tuple(ipaddress.ip_network(value) for value in ("127.0.0.0/8", "192.168.0.0/16", "10.0.0.0/8", "::1/128"))
-        is_local_development_ip = any(client_ip in network for network in local_dev_networks)
-        if constraints["cidrs"] and not is_local_development_ip:
+        if constraints["cidrs"]:
             allowed_networks = [ipaddress.ip_network(value, strict=False) for value in constraints["cidrs"]]
             if not any(client_ip in network for network in allowed_networks):
                 conn.close()
@@ -2801,7 +2984,7 @@ def verify_face_and_attendance(
     email: str = Form(...),
     otp_code: str = Form(...),
     device_uuid: str = Form(...),
-    image_base64: str = Form(...),
+    image_base64: str | None = Form(None),
     latitude: str | None = Form(None),
     longitude: str | None = Form(None),
 ):
@@ -3007,11 +3190,20 @@ def doctor_report(class_id: str):
 
 def initialize_api_database():
     """Initialize API-owned SQLite schemas and seed data without starting workers."""
-    ensure_academic_schema()
-    with closing(sqlite3.connect(DATABASE_PATH)) as conn, conn:
-        seed_doctor_accounts(conn)
-        seed_master_schedule(conn)
-    ensure_materials_table()
+    try:
+        ensure_academic_schema()
+    except sqlite3.OperationalError:
+        logger.warning("Continuing startup after an SQLite academic-schema migration error", exc_info=True)
+    try:
+        with closing(sqlite3.connect(DATABASE_PATH)) as conn, conn:
+            seed_doctor_accounts(conn)
+            seed_master_schedule(conn)
+    except sqlite3.OperationalError:
+        logger.warning("Skipping optional SQLite seed data after a schema migration error", exc_info=True)
+    try:
+        ensure_materials_table()
+    except sqlite3.OperationalError:
+        logger.warning("Continuing startup after an SQLite materials-schema migration error", exc_info=True)
 
 
 initialize_api_database()
