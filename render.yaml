@@ -1,0 +1,75 @@
+services:
+  - type: web
+    name: sajjilni
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /ping
+    autoDeployTrigger: commit
+    numInstances: 1
+    disk:
+      name: sajjilni-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: DATABASE_PATH
+        value: /var/data/attendance.db
+      - key: MATERIALS_DIR
+        value: /var/data/materials
+      - key: ATTENDANCE_SNAPSHOT_DIR
+        value: /var/data/attendance_snapshots
+      - key: APP_TIMEZONE
+        value: Asia/Baghdad
+      - key: ATTENDANCE_BOT_TOKEN
+        sync: false
+      - key: ATTENDANCE_CHAT_ID
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: TELEGRAM_CYBERSECURITY_GROUP_B_CHAT_ID
+        sync: false
+      - key: TELEGRAM_CYBERSECURITY_GROUP_B_TOPIC_ID
+        sync: false
+      - key: TELEGRAM_GROUP_CHAT_IDS
+        sync: false
+      - fromGroup: sajjilni-lecture-ingestion
+  - type: worker
+    name: sajjilni-lecture-bot
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    autoDeployTrigger: commit
+    disk:
+      name: sajjilni-lecture-bot-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - fromGroup: sajjilni-lecture-ingestion
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_LECTURE_CHAT_IDS
+        sync: false
+      - key: TELEGRAM_LECTURE_DEPARTMENTS
+        sync: false
+      - key: TOPIC_MAP_FILE
+        value: /var/data/topic_map.json
+      - key: DEFAULT_LECTURE_DEPARTMENT
+        value: "\u0627\u0644\u0623\u0645\u0646 \u0627\u0644\u0633\u064a\u0628\u0631\u0627\u0646\u064a"
+      - key: GOOGLE_DRIVE_FOLDER_ID
+        value: 12Dz6_w7C3OAZmyOHx5kq1L8okOYla_7A
+      - key: GOOGLE_OAUTH_TOKEN_FILE
+        value: /etc/secrets/token.json
+      - key: SAJJILNI_API_URL
+        sync: false
+
+envVarGroups:
+  - name: sajjilni-lecture-ingestion
+    envVars:
+      - key: LECTURE_INGEST_API_KEY
+        generateValue: true
+      - key: TELEGRAM_CYBERSECURITY_CHAT_ID
+        value: "-100439103"

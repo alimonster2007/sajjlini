@@ -1,0 +1,41 @@
+# Python bytecode and environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+topic_map.json
+topic_map.json.tmp
+credentials.json
+token.json
+service-account*.json
+google-credentials*.json
+*.pem
+*.key
+
+# Local SQLite data and journals
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Runtime uploads / attendance photos (the static directory keeps its icon assets)
+static/materials/*
+!static/materials/.gitkeep
+attendance_snapshots/*
+!attendance_snapshots/.gitkeep
+
+# Editor/OS files and local captures
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+SharedScreenshot.jpg
+inde.TXT

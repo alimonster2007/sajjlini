@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="180" height="180" viewBox="0 0 24 24" fill="none">
+  <rect width="24" height="24" rx="5" fill="#fff"/>
+  <path d="M12 2L3 6V12C3 17.52 6.84 22.74 12 24C17.16 22.74 21 17.52 21 12V6L12 2Z" fill="#2563eb" fill-opacity="0.1" stroke="#2563eb" stroke-width="2" stroke-linejoin="round"/>
+  <text x="12" y="16" font-family="Cairo, Segoe UI, sans-serif" font-weight="800" font-size="11" fill="#2563eb" text-anchor="middle">س</text>
+</svg>
